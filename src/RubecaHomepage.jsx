@@ -20,7 +20,7 @@
  *   torna come indicatore di progresso, separatore di sezione, sotto i titoli
  *   delle card e nel focus dei campi del form.
  */
-import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowRight,
@@ -28,11 +28,18 @@ import {
   Award,
   BadgeCheck,
   Building2,
+  Calendar,
   CalendarClock,
+  Car,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Clock,
+  Cog,
   Facebook,
+  Fuel,
+  Gauge,
   Instagram,
   Landmark,
   Leaf,
@@ -44,10 +51,14 @@ import {
   Phone,
   Route,
   ShieldCheck,
+  RotateCcw,
   UserRound,
   Wrench,
   X,
+  Zap,
 } from 'lucide-react';
+/* Stock veicoli estratto da rubeca.it con scripts/estrai-veicoli.mjs (vedi estrattoIl nel file). */
+import VEHICLES_DATA from './vehicles.json';
 
 /* ------------------------------------------------------------------ */
 /* CONFIG: tutto ciò che non è nelle fonti verificate                  */
@@ -102,7 +113,29 @@ const CONFIG = {
   clientLogos: [],
   companyName: 'Rubeca Motori S.r.l.',
   vat: '02937620546',
+  // DA POPOLARE: feed stock del cliente (DMS/portale). Se valorizzato, i veicoli arrivano da qui
+  // con fetch in pagina (JSON: array di veicoli oppure { veicoli: [...] }, schema VEHICLE_SCHEMA).
+  // Se vuoto, si usa VEHICLES (estratto da rubeca.it).
+  vehiclesFeedUrl: '',
+  // DA VERIFICARE CON IL CLIENTE: pagina con tutto lo stock
+  stockUrl: 'https://www.rubeca.it/auto/',
 };
+
+/* Schema di un veicolo. I campi assenti nella fonte restano null e non si mostrano.
+   {
+     id, stato,                 // "Nuovo" | "Km0" | "Usato Certificato"
+     marca, modello, versione,
+     anno, immatricolazione,    // immatricolazione "MM/AAAA" solo sugli usati
+     km, alimentazione, cambio, potenzaCv, colore,
+     prezzo,                    // numero in € come da fonte, nessun calcolo IVA
+     prezzoNota,                // testo esatto della fonte, es. "IVA inclusa"
+     canoneMensile, canoneNota, // solo se la fonte riporta anche le condizioni
+     consumoCombinato, emissioniCo2, classeEmissione,
+     foto: [url],               // solo foto reali del veicolo
+     urlScheda                  // scheda sul sito del cliente
+   } */
+const VEHICLES = VEHICLES_DATA.veicoli || [];
+const VEHICLES_UPDATED = VEHICLES_DATA.estrattoIl ? new Date(VEHICLES_DATA.estrattoIl) : null;
 
 const ASSETS = {
   logo: '/assets/logo-rubeca.svg',
@@ -127,6 +160,7 @@ const HERO_STATIC_GATES = [
 
 const NAV_LINKS = [
   { href: '#servizi', label: 'Servizi' },
+  { href: '#veicoli', label: 'Veicoli' },
   { href: '#perche-noi', label: 'Perché noi' },
   { href: '#sedi', label: 'Sedi' },
   { href: '#contatti', label: 'Contatti' },
@@ -237,7 +271,7 @@ const STATS = [
 ];
 
 const VEHICLE_OPTIONS = ['1–5', '6–20', '21–50', 'Oltre 50'];
-const INTEREST_OPTIONS = ['Flotta in noleggio', 'Acquisto flotta', 'Service flotta', 'Altro'];
+const INTEREST_OPTIONS = ['Flotta in noleggio', 'Acquisto flotta', 'Service flotta', 'Veicolo specifico', 'Ricerca veicolo', 'Altro'];
 
 /* Classi condivise */
 const CONTAINER = 'mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8';
@@ -601,7 +635,7 @@ function Header() {
                 key={l.href}
                 className={`transition duration-700 ease-out motion-reduce:transition-none ${
                   open ? 'translate-x-0 opacity-100' : 'translate-x-8 opacity-0'
-                } ${['delay-100', 'delay-150', 'delay-200', 'delay-300'][i]}`}
+                } ${['delay-100', 'delay-150', 'delay-200', 'delay-300', 'delay-500'][i]}`}
               >
                 <a
                   href={l.href}
@@ -1263,7 +1297,575 @@ function ServicesSection({ onRequest }) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 2. Fiducia                                                         */
+/* 2. Veicoli disponibili                                             */
+/* ------------------------------------------------------------------ */
+const STATE_TABS = ['Tutti', 'Nuovo', 'Km0', 'Usato Certificato'];
+const SORTS = [
+  { id: 'price-asc', label: 'Prezzo crescente' },
+  { id: 'price-desc', label: 'Prezzo decrescente' },
+  { id: 'recent', label: 'Più recenti' },
+];
+const PAGE_SIZE = 6;
+const EMISSION_LABELS = { EURO6: 'Euro 6', ZERO_EMISSION: 'Zero emissioni' };
+const formatEuro = (n) => `€ ${new Intl.NumberFormat('it-IT', { maximumFractionDigits: 0 }).format(n)}`;
+const formatKm = (n) => `${new Intl.NumberFormat('it-IT').format(n)} km`;
+/* La versione di alcuni nuovi ripete il modello ("Polo Young 1.0...", "Nuova ID. Polo Trend..."):
+   in visualizzazione tolgo il modello ripetuto in testa, il dato resta invariato */
+const displayVersion = (v) => {
+  if (!v.versione || !v.modello) return v.versione;
+  const i = v.versione.toLowerCase().indexOf(v.modello.toLowerCase() + ' ');
+  return i >= 0 && i <= 6 ? v.versione.slice(i + v.modello.length + 1) : v.versione;
+};
+const vehicleLabel = (v) => [v.modello, displayVersion(v)].filter(Boolean).join(' ') + (v.stato ? ` · ${v.stato}` : '');
+const vehicleAlt = (v) =>
+  `${[v.marca, v.modello].filter(Boolean).join(' ')}${v.colore ? `, colore ${v.colore.toLowerCase()}` : ''}`;
+/* anno + mese di immatricolazione quando c'è, per ordinare "Più recenti" */
+const recency = (v) => {
+  const m = v.immatricolazione?.match(/^(\d{2})\/(\d{4})$/);
+  return m ? Number(m[2]) * 12 + Number(m[1]) : (v.anno || 0) * 12 + 12;
+};
+
+/* Stock: feed del cliente se configurato, altrimenti i dati estratti */
+function useVehicles() {
+  const [state, setState] = useState(() =>
+    CONFIG.vehiclesFeedUrl ? { status: 'loading', items: [] } : { status: 'ready', items: VEHICLES },
+  );
+  useEffect(() => {
+    if (!CONFIG.vehiclesFeedUrl) return undefined;
+    const ctrl = new AbortController();
+    fetch(CONFIG.vehiclesFeedUrl, { signal: ctrl.signal, headers: { Accept: 'application/json' } })
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((json) => {
+        const items = Array.isArray(json) ? json : json?.veicoli || [];
+        setState({ status: 'ready', items: items.filter((v) => v && v.id && v.stato) });
+      })
+      .catch((err) => {
+        if (err.name !== 'AbortError') setState({ status: 'error', items: [] });
+      });
+    return () => ctrl.abort();
+  }, []);
+  return state;
+}
+
+/* Silhouette neutra quando manca la foto */
+function PhotoPlaceholder() {
+  return (
+    <div className="flex h-full w-full flex-col items-center justify-center gap-3 bg-[linear-gradient(160deg,#001E50_0%,#0A2A63_100%)] text-white/80">
+      <svg viewBox="0 0 160 60" className="w-2/3 max-w-[220px]" aria-hidden="true">
+        <path
+          d="M8 44c0-6 4-9 10-10l18-3 16-12c4-3 9-5 15-5h30c6 0 11 2 15 6l14 12 16 3c6 1 10 5 10 11v4H8z"
+          fill="none"
+          stroke="rgba(255,255,255,0.55)"
+          strokeWidth="1.5"
+          strokeLinejoin="round"
+        />
+        <circle cx="42" cy="48" r="8" fill="#001E50" stroke="rgba(255,255,255,0.55)" strokeWidth="1.5" />
+        <circle cx="118" cy="48" r="8" fill="#001E50" stroke="rgba(255,255,255,0.55)" strokeWidth="1.5" />
+        <line x1="8" y1="57" x2="152" y2="57" stroke="#0066FF" strokeWidth="1.5" />
+      </svg>
+      <span className="text-xs font-semibold uppercase tracking-[0.25em]">Foto in arrivo</span>
+    </div>
+  );
+}
+
+const STATE_BADGE = {
+  Nuovo: 'bg-brand-blue text-white',
+  Km0: 'bg-brand-navy text-white',
+  'Usato Certificato': 'border border-white/60 bg-white/80 text-brand-navy backdrop-blur-md',
+};
+
+function VehicleCard({ v, onRequest }) {
+  const [imgFailed, setImgFailed] = useState(!v.foto?.length);
+  const [shown, setShown] = useState(false);
+  const titleId = useId();
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setShown(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+  const FuelIcon = /elettric/i.test(v.alimentazione || '') ? Zap : Fuel;
+  const specs = [
+    (v.immatricolazione || v.anno) && { icon: Calendar, label: 'Anno', value: v.immatricolazione || String(v.anno) },
+    v.km != null && { icon: Gauge, label: 'Chilometri', value: formatKm(v.km) },
+    v.alimentazione && { icon: FuelIcon, label: 'Alimentazione', value: v.alimentazione },
+    v.cambio && { icon: Cog, label: 'Cambio', value: v.cambio },
+  ].filter(Boolean);
+  const emissions = [
+    v.consumoCombinato && `Consumo combinato ${v.consumoCombinato}`,
+    v.emissioniCo2 && `CO2 ${v.emissioniCo2}`,
+    v.classeEmissione && (EMISSION_LABELS[v.classeEmissione] || v.classeEmissione),
+  ].filter(Boolean);
+  const version = displayVersion(v);
+
+  return (
+    <article
+      aria-labelledby={titleId}
+      className={`group flex h-full flex-col overflow-hidden rounded-2xl border border-brand-navy/10 bg-white transition duration-500 ease-out hover:-translate-y-1 hover:shadow-[0_30px_80px_-20px_rgba(0,30,80,0.35)] motion-reduce:translate-y-0 motion-reduce:opacity-100 motion-reduce:transition-none motion-reduce:hover:translate-y-0 ${
+        shown ? 'translate-y-0 opacity-100' : 'translate-y-4 opacity-0'
+      }`}
+    >
+      <div className="relative aspect-[16/10] overflow-hidden rounded-2xl bg-brand-navy">
+        {imgFailed ? (
+          <PhotoPlaceholder />
+        ) : (
+          <img
+            src={v.foto[0]}
+            alt={vehicleAlt(v)}
+            width="800"
+            height="500"
+            loading="lazy"
+            decoding="async"
+            onError={() => setImgFailed(true)}
+            className="h-full w-full object-cover transition-transform duration-[1600ms] ease-out group-hover:scale-105 motion-reduce:transition-none motion-reduce:group-hover:scale-100"
+          />
+        )}
+        {v.stato && (
+          <span className={`absolute left-3 top-3 rounded-full px-3 py-1 text-xs font-semibold ${STATE_BADGE[v.stato] || STATE_BADGE.Nuovo}`}>
+            {v.stato}
+          </span>
+        )}
+      </div>
+
+      <div className="flex flex-1 flex-col p-5 sm:p-6">
+        <p className={`${EYEBROW} text-brand-navy/70`}>{v.marca}</p>
+        <h3 id={titleId} className="mt-2 text-2xl font-bold tracking-tight text-brand-navy">
+          {v.modello}
+        </h3>
+        <span
+          aria-hidden="true"
+          className="mt-2 block h-px w-16 origin-left scale-x-0 bg-brand-blue transition-transform duration-700 ease-out group-hover:scale-x-100 motion-reduce:transition-none"
+        />
+        {version && <p className="mt-2 text-sm leading-snug text-brand-slate">{version}</p>}
+
+        {specs.length > 0 && (
+          <dl className="mt-4 flex flex-wrap gap-x-4 gap-y-2 text-sm text-brand-slate">
+            {specs.map((s) => {
+              const Icon = s.icon;
+              return (
+                <div key={s.label} className="flex items-center gap-1.5">
+                  <dt className="sr-only">{s.label}</dt>
+                  <Icon size={16} strokeWidth={1.5} className="shrink-0 text-brand-blue" aria-hidden="true" />
+                  <dd>{s.value}</dd>
+                </div>
+              );
+            })}
+          </dl>
+        )}
+
+        <div className="mt-auto pt-5">
+          <div className="border-t border-brand-navy/10 pt-4">
+            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brand-slate/90">Prezzo</p>
+            <p className="mt-1 text-2xl font-bold tabular-nums text-brand-navy">{formatEuro(v.prezzo)}</p>
+            {v.prezzoNota && <p className="mt-0.5 text-xs text-brand-slate">{v.prezzoNota}</p>}
+            {v.canoneMensile != null && v.canoneNota && (
+              <p className="mt-2 text-sm text-brand-slate">
+                <span className="font-semibold text-brand-navy">{formatEuro(v.canoneMensile)} al mese</span>
+                <span className="block text-xs">{v.canoneNota}</span>
+              </p>
+            )}
+            {emissions.length > 0 && <p className="mt-3 text-xs leading-relaxed text-brand-slate">{emissions.join(' · ')}</p>}
+          </div>
+          <div className="mt-5 flex flex-wrap items-center gap-x-5 gap-y-3">
+            <button
+              type="button"
+              onClick={() => onRequest('Veicolo specifico', { id: v.id, label: vehicleLabel(v) })}
+              className={`${BTN_PRIMARY} !min-h-[44px] !px-5 !py-2.5`}
+              aria-describedby={titleId}
+            >
+              Richiedi informazioni <ArrowRight size={16} strokeWidth={1.5} aria-hidden="true" />
+            </button>
+            {v.urlScheda && (
+              <a
+                href={v.urlScheda}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={`inline-flex min-h-[44px] items-center gap-1 rounded text-sm font-semibold text-brand-navy underline-offset-4 hover:text-brand-blue hover:underline ${FOCUS_RING}`}
+              >
+                Scheda completa <ArrowUpRight size={16} strokeWidth={1.5} aria-hidden="true" />
+                <span className="sr-only">di {v.marca} {v.modello}, si apre in una nuova scheda</span>
+              </a>
+            )}
+          </div>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function VehiclesEmpty({ filtered, error, onReset, onRequest }) {
+  return (
+    <div className="flex flex-col items-start gap-6 rounded-2xl border border-brand-navy/10 bg-white p-8 shadow-[0_30px_80px_-20px_rgba(0,30,80,0.25)] sm:flex-row sm:items-center sm:p-10">
+      <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-full bg-brand-ice text-brand-blue">
+        <Car size={28} strokeWidth={1.5} aria-hidden="true" />
+      </span>
+      <div className="flex-1">
+        <p className="text-xl font-semibold tracking-tight text-brand-navy">
+          {filtered ? 'Nessuna auto con questi filtri.' : 'Lo stock cambia spesso.'}
+        </p>
+        <p className="mt-2 max-w-[56ch] text-base leading-relaxed text-brand-slate">
+          {error ? 'Al momento non riusciamo a caricare le auto disponibili. ' : ''}
+          Dicci cosa cerchi e ti segnaliamo le auto disponibili appena arrivano.
+        </p>
+      </div>
+      <div className="flex flex-wrap gap-3">
+        {filtered && (
+          <button
+            type="button"
+            onClick={onReset}
+            className={`inline-flex min-h-[44px] items-center gap-2 rounded-full border border-brand-navy/20 px-5 text-sm font-semibold text-brand-navy transition hover:border-brand-navy ${FOCUS_RING}`}
+          >
+            <RotateCcw size={16} strokeWidth={1.5} aria-hidden="true" /> Azzera filtri
+          </button>
+        )}
+        <button type="button" onClick={() => onRequest('Ricerca veicolo')} className={`${BTN_PRIMARY} !min-h-[44px] !px-5 !py-2.5`}>
+          Dicci cosa cerchi <ArrowRight size={16} strokeWidth={1.5} aria-hidden="true" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function VehiclesSection({ onRequest }) {
+  const { status, items } = useVehicles();
+  const reduced = usePrefersReducedMotion();
+  const [tab, setTab] = useState('Tutti');
+  const [fuel, setFuel] = useState(null);
+  const [sort, setSort] = useState('price-asc');
+  const [limit, setLimit] = useState(PAGE_SIZE);
+  const tabsRef = useRef([]);
+  const listRef = useRef(null);
+  const baseId = useId();
+
+  /* Tab visibili: solo stati con almeno un veicolo */
+  const counts = useMemo(() => {
+    const c = { Tutti: items.length };
+    items.forEach((v) => (c[v.stato] = (c[v.stato] || 0) + 1));
+    return c;
+  }, [items]);
+  const tabs = STATE_TABS.filter((t) => counts[t] > 0);
+
+  /* Chip alimentazione: valori reali presenti nei dati del tab corrente */
+  const inTab = useMemo(() => (tab === 'Tutti' ? items : items.filter((v) => v.stato === tab)), [items, tab]);
+  const fuels = useMemo(() => {
+    const c = {};
+    inTab.forEach((v) => v.alimentazione && (c[v.alimentazione] = (c[v.alimentazione] || 0) + 1));
+    return Object.entries(c).sort((a, b) => b[1] - a[1]);
+  }, [inTab]);
+
+  const filtered = useMemo(() => {
+    const list = fuel ? inTab.filter((v) => v.alimentazione === fuel) : [...inTab];
+    if (sort === 'price-asc') list.sort((a, b) => a.prezzo - b.prezzo);
+    if (sort === 'price-desc') list.sort((a, b) => b.prezzo - a.prezzo);
+    if (sort === 'recent') list.sort((a, b) => recency(b) - recency(a) || a.prezzo - b.prezzo);
+    return list;
+  }, [inTab, fuel, sort]);
+
+  /* Transizione al cambio filtro: la lista esce, cambia e rientra; l'altezza resta riservata */
+  const filterKey = `${tab}|${fuel}|${sort}`;
+  const [shownKey, setShownKey] = useState(filterKey);
+  const [phase, setPhase] = useState('in');
+  const [lockedHeight, setLockedHeight] = useState(null);
+  useEffect(() => {
+    if (filterKey === shownKey) return undefined;
+    if (reduced) {
+      setShownKey(filterKey);
+      setLimit(PAGE_SIZE);
+      return undefined;
+    }
+    setLockedHeight(listRef.current?.offsetHeight || null);
+    setPhase('out');
+    const t1 = setTimeout(() => {
+      setShownKey(filterKey);
+      setLimit(PAGE_SIZE);
+      setPhase('in');
+    }, 220);
+    const t2 = setTimeout(() => setLockedHeight(null), 700);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, [filterKey, shownKey, reduced]);
+
+  const [visibleList, setVisibleList] = useState(filtered);
+  useEffect(() => {
+    if (shownKey === filterKey) setVisibleList(filtered);
+  }, [shownKey, filterKey, filtered]);
+  const visible = visibleList.slice(0, limit);
+
+  /* Carosello mobile: indicatore di posizione */
+  const [slide, setSlide] = useState(0);
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return undefined;
+    let raf = null;
+    const onScroll = () => {
+      if (raf !== null) return;
+      raf = requestAnimationFrame(() => {
+        raf = null;
+        const first = el.firstElementChild;
+        if (!first) return;
+        const step = first.getBoundingClientRect().width + 16;
+        setSlide(Math.round(el.scrollLeft / step));
+      });
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      if (raf !== null) cancelAnimationFrame(raf);
+    };
+  }, []);
+  useEffect(() => {
+    listRef.current?.scrollTo({ left: 0 });
+    setSlide(0);
+  }, [shownKey]);
+  const scrollSlide = (dir) => {
+    const el = listRef.current;
+    const first = el?.firstElementChild;
+    if (!first) return;
+    el.scrollBy({ left: dir * (first.getBoundingClientRect().width + 16), behavior: reduced ? 'auto' : 'smooth' });
+  };
+
+  const onTabKey = (e) => {
+    const i = tabs.indexOf(tab);
+    let next = null;
+    if (e.key === 'ArrowRight') next = (i + 1) % tabs.length;
+    if (e.key === 'ArrowLeft') next = (i - 1 + tabs.length) % tabs.length;
+    if (next === null) return;
+    e.preventDefault();
+    setTab(tabs[next]);
+    setFuel(null);
+    tabsRef.current[next]?.focus();
+  };
+  const resetFilters = () => {
+    setTab('Tutti');
+    setFuel(null);
+    setSort('price-asc');
+  };
+
+  const filtersActive = tab !== 'Tutti' || fuel !== null;
+  const updated =
+    VEHICLES_UPDATED && !CONFIG.vehiclesFeedUrl && items.length > 0 ? VEHICLES_UPDATED.toLocaleDateString('it-IT') : null;
+
+  return (
+    <section id="veicoli" aria-labelledby="veicoli-title" className="scroll-mt-16 bg-brand-ice py-24 lg:py-32">
+      <div className={CONTAINER}>
+        <SectionMarker index="02" label="Veicoli" />
+        <div className="mt-12 grid gap-8 lg:grid-cols-12 lg:items-end">
+          <Reveal className="lg:col-span-7">
+            <p className={`${EYEBROW} text-brand-blue`}>Disponibili subito</p>
+            <h2 id="veicoli-title" className="mt-4 text-4xl font-bold leading-[1.02] tracking-tight text-brand-slate sm:text-5xl lg:text-6xl">
+              Pronte in <span className="text-brand-navy">concessionaria</span>, non in catalogo.
+            </h2>
+            <SignatureLine className="mt-6 max-w-md" />
+          </Reveal>
+          <Reveal delay={1} className="lg:col-span-5">
+            <p className="max-w-[52ch] text-base leading-relaxed text-brand-slate lg:text-lg">
+              Nuove in pronta consegna e Usato Certificato. Scegli un’auto, per te o per la flotta, e ti prepariamo una
+              proposta per la tua azienda.
+            </p>
+          </Reveal>
+        </div>
+
+        {status === 'loading' && (
+          <div className="mt-12 grid gap-5 sm:grid-cols-2 lg:grid-cols-3" aria-busy="true" aria-label="Caricamento veicoli">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className="h-[520px] animate-pulse rounded-2xl bg-white/70 motion-reduce:animate-none" />
+            ))}
+          </div>
+        )}
+
+        {status !== 'loading' && items.length === 0 && (
+          <div className="mt-12">
+            <VehiclesEmpty error={status === 'error'} onRequest={onRequest} />
+          </div>
+        )}
+
+        {status === 'ready' && items.length > 0 && (
+          <>
+            {/* Filtri */}
+            <div className="mt-12 flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
+              <div
+                role="tablist"
+                aria-label="Stato del veicolo"
+                onKeyDown={onTabKey}
+                className="-mx-4 flex gap-2 overflow-x-auto px-4 pb-1 [scrollbar-width:none] sm:mx-0 sm:px-0 [&::-webkit-scrollbar]:hidden"
+              >
+                {tabs.map((t, i) => (
+                  <button
+                    key={t}
+                    ref={(el) => {
+                      tabsRef.current[i] = el;
+                    }}
+                    role="tab"
+                    type="button"
+                    id={`${baseId}-tab-${i}`}
+                    aria-selected={tab === t}
+                    aria-controls={`${baseId}-list`}
+                    tabIndex={tab === t ? 0 : -1}
+                    onClick={() => {
+                      setTab(t);
+                      setFuel(null);
+                    }}
+                    className={`inline-flex min-h-[44px] shrink-0 items-center gap-2 rounded-full px-5 text-sm font-semibold transition-colors duration-300 motion-reduce:transition-none ${FOCUS_RING} ${
+                      tab === t ? 'bg-brand-navy text-white' : 'border border-brand-navy/15 bg-white text-brand-navy hover:border-brand-navy/40'
+                    }`}
+                  >
+                    {t}
+                    <span
+                      className={`rounded-full px-2 py-0.5 text-xs tabular-nums ${tab === t ? 'bg-white/15 text-white' : 'bg-brand-ice text-brand-navy'}`}
+                    >
+                      {counts[t]}
+                    </span>
+                  </button>
+                ))}
+              </div>
+              <div className="relative self-start lg:self-auto">
+                <label htmlFor={`${baseId}-sort`} className="sr-only">
+                  Ordina per
+                </label>
+                <select
+                  id={`${baseId}-sort`}
+                  value={sort}
+                  onChange={(e) => setSort(e.target.value)}
+                  className={`min-h-[44px] appearance-none rounded-full border border-brand-navy/15 bg-white py-2 pl-5 pr-11 text-sm font-semibold text-brand-navy hover:border-brand-navy/40 ${FOCUS_RING}`}
+                >
+                  {SORTS.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.label}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown size={16} strokeWidth={1.5} className="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-brand-navy/70" aria-hidden="true" />
+              </div>
+            </div>
+
+            {fuels.length > 1 && (
+              <div className="mt-4 flex flex-wrap gap-2" role="group" aria-label="Alimentazione">
+                {fuels.map(([f, n]) => {
+                  const active = fuel === f;
+                  return (
+                    <button
+                      key={f}
+                      type="button"
+                      aria-pressed={active}
+                      onClick={() => setFuel(active ? null : f)}
+                      className={`inline-flex min-h-[36px] items-center gap-1.5 rounded-full px-4 text-xs font-semibold transition-colors duration-300 motion-reduce:transition-none ${FOCUS_RING} ${
+                        active ? 'bg-brand-blue text-white' : 'border border-brand-navy/15 bg-white/70 text-brand-navy hover:border-brand-navy/40'
+                      }`}
+                    >
+                      {f}
+                      <span className={active ? 'text-white/85' : 'text-brand-slate/90'}>{n}</span>
+                      {active && <X size={14} strokeWidth={1.5} aria-hidden="true" />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            <p className="mt-6 text-sm text-brand-slate" aria-live="polite">
+              {filtered.length === 0
+                ? 'Nessun veicolo con questi filtri'
+                : `${Math.min(limit, filtered.length)} di ${filtered.length} ${filtered.length === 1 ? 'veicolo' : 'veicoli'}`}
+            </p>
+
+            {/* Lista: carosello su mobile, griglia da tablet */}
+            <div
+              className={`transition duration-200 ease-out motion-reduce:transition-none ${
+                phase === 'out' ? 'translate-y-2 opacity-0' : 'translate-y-0 opacity-100'
+              }`}
+              style={lockedHeight ? { minHeight: `${lockedHeight}px` } : undefined}
+            >
+              {visible.length === 0 ? (
+                <div className="mt-4">
+                  <VehiclesEmpty filtered onReset={resetFilters} onRequest={onRequest} />
+                </div>
+              ) : (
+                <>
+                  <ul
+                    ref={listRef}
+                    id={`${baseId}-list`}
+                    role="list"
+                    tabIndex={0}
+                    aria-label="Veicoli disponibili"
+                    className={`-mx-4 mt-4 flex snap-x snap-mandatory gap-4 overflow-x-auto scroll-px-4 px-4 pb-4 [scrollbar-width:none] sm:mx-0 sm:grid sm:snap-none sm:grid-cols-2 sm:gap-5 sm:overflow-visible sm:px-0 lg:grid-cols-3 [&::-webkit-scrollbar]:hidden ${FOCUS_RING} focus-visible:ring-offset-brand-ice`}
+                  >
+                    {visible.map((v) => (
+                      <li key={v.id} className="w-[85%] shrink-0 snap-start sm:w-auto">
+                        <VehicleCard v={v} onRequest={onRequest} />
+                      </li>
+                    ))}
+                  </ul>
+
+                  {/* Indicatore e frecce del carosello, solo mobile */}
+                  {visible.length > 1 && (
+                    <div className="mt-2 flex items-center justify-between sm:hidden">
+                      <p className="text-sm font-semibold tabular-nums text-brand-navy" aria-hidden="true">
+                        {Math.min(slide + 1, visible.length)} / {visible.length}
+                      </p>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => scrollSlide(-1)}
+                          aria-label="Veicolo precedente"
+                          disabled={slide <= 0}
+                          className={`inline-flex h-11 w-11 items-center justify-center rounded-full border border-brand-navy/15 bg-white text-brand-navy disabled:opacity-40 ${FOCUS_RING}`}
+                        >
+                          <ChevronLeft size={20} strokeWidth={1.5} aria-hidden="true" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => scrollSlide(1)}
+                          aria-label="Veicolo successivo"
+                          disabled={slide >= visible.length - 1}
+                          className={`inline-flex h-11 w-11 items-center justify-center rounded-full border border-brand-navy/15 bg-white text-brand-navy disabled:opacity-40 ${FOCUS_RING}`}
+                        >
+                          <ChevronRight size={20} strokeWidth={1.5} aria-hidden="true" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {filtered.length > limit && (
+                    <div className="mt-8 flex justify-center">
+                      <button
+                        type="button"
+                        onClick={() => setLimit((l) => l + PAGE_SIZE)}
+                        className={`inline-flex min-h-[48px] items-center gap-2 rounded-full border border-brand-navy/20 bg-white px-7 text-sm font-semibold text-brand-navy transition hover:border-brand-navy ${FOCUS_RING}`}
+                      >
+                        Mostra altri <ChevronDown size={16} strokeWidth={1.5} aria-hidden="true" />
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </>
+        )}
+
+        <div className="mt-12 flex flex-col gap-3 border-t border-brand-navy/10 pt-6 text-sm text-brand-slate sm:flex-row sm:items-center sm:justify-between">
+          <p>
+            {updated ? `Dati e foto da rubeca.it, aggiornati al ${updated}. ` : ''}
+            Prezzi e disponibilità da confermare in concessionaria.
+          </p>
+          <a
+            href={CONFIG.stockUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={`inline-flex min-h-[44px] items-center gap-1 rounded font-semibold text-brand-navy hover:text-brand-blue ${FOCUS_RING}`}
+          >
+            Vedi tutto lo stock su rubeca.it <ArrowUpRight size={16} strokeWidth={1.5} aria-hidden="true" />
+            <span className="sr-only">(si apre in una nuova scheda)</span>
+          </a>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* 3. Fiducia                                                         */
 /* ------------------------------------------------------------------ */
 function Counter({ value, run }) {
   const ref = useRef(null);
@@ -1309,7 +1911,7 @@ function TrustSection() {
         className="pointer-events-none absolute -right-1/4 top-0 h-[70%] w-[80%] bg-[radial-gradient(ellipse_at_center,rgba(0,102,255,0.16)_0%,rgba(0,102,255,0)_65%)] motion-safe:animate-[pulse_9s_ease-in-out_infinite]"
       />
       <div className={`${CONTAINER} relative`}>
-        <SectionMarker index="02" label="Perché noi" dark />
+        <SectionMarker index="03" label="Perché noi" dark />
 
         {/* Fascia numerica: solo dati verificati */}
         <dl ref={statsRef} className="mt-14 grid gap-10 sm:grid-cols-3 sm:gap-6">
@@ -1488,9 +2090,29 @@ function ContactSection({ prefill }) {
   const formRef = useRef(null);
   const statusRef = useRef(null);
 
+  const [vehicle, setVehicle] = useState(null); // veicolo scelto da una card: { id, label }
+  const valuesRef = useRef(values);
+  valuesRef.current = values;
+
   useEffect(() => {
-    if (prefill?.interest) setValues((v) => ({ ...v, interest: prefill.interest }));
+    if (!prefill) return undefined;
+    if (prefill.interest) setValues((v) => ({ ...v, interest: prefill.interest }));
+    setVehicle(prefill.vehicle || null);
+    /* Focus sul primo campo ancora vuoto, a scroll concluso */
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const t = setTimeout(() => {
+      const v = { ...valuesRef.current, interest: prefill.interest || valuesRef.current.interest };
+      const key = ['name', 'company', 'email', 'phone', 'vehicles', 'interest'].find((k) => !v[k]) || 'message';
+      document.getElementById(`f-${key}`)?.focus({ preventScroll: true });
+    }, reduced ? 50 : 650);
+    return () => clearTimeout(t);
   }, [prefill]);
+
+  const clearVehicle = () => {
+    setVehicle(null);
+    setValues((v) => (v.interest === 'Veicolo specifico' ? { ...v, interest: '' } : v));
+    document.getElementById('f-interest')?.focus();
+  };
 
   useEffect(() => {
     if (status === 'success' || status === 'error') statusRef.current?.focus();
@@ -1517,7 +2139,12 @@ function ContactSection({ prefill }) {
         const res = await fetch(CONFIG.formEndpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-          body: JSON.stringify({ ...values, source: 'homepage-flotte' }),
+          body: JSON.stringify({
+            ...values,
+            vehicleId: vehicle?.id ?? null,
+            vehicleDescription: vehicle?.label ?? null,
+            source: 'homepage-flotte',
+          }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
       } else {
@@ -1525,6 +2152,7 @@ function ContactSection({ prefill }) {
       }
       setSubmittedName(values.name.trim().split(/\s+/)[0]);
       setValues(EMPTY_FORM);
+      setVehicle(null);
       setStatus('success');
     } catch {
       setStatus('error');
@@ -1545,7 +2173,7 @@ function ContactSection({ prefill }) {
   return (
     <section id="contatti" aria-labelledby="contatti-title" className="scroll-mt-16 bg-brand-ice py-24 lg:py-32">
       <div className={CONTAINER}>
-        <SectionMarker index="03" label="Contatti" />
+        <SectionMarker index="04" label="Contatti" />
         <div className="mt-14 grid gap-12 lg:grid-cols-12 lg:gap-16">
           <div className="lg:col-span-5">
             <Reveal>
@@ -1618,6 +2246,23 @@ function ContactSection({ prefill }) {
                 </div>
               ) : (
                 <form ref={formRef} onSubmit={handleSubmit} noValidate className="grid gap-6 sm:grid-cols-2">
+                  {vehicle && (
+                    <div className="sm:col-span-2">
+                      <p className={`${EYEBROW} text-brand-navy/70`}>Veicolo scelto</p>
+                      <div className="mt-2 inline-flex max-w-full items-center gap-2 rounded-full border border-brand-blue/30 bg-white py-1.5 pl-4 pr-1.5 text-sm font-semibold text-brand-navy shadow-[0_10px_30px_-12px_rgba(0,30,80,0.35)]">
+                        <Car size={16} strokeWidth={1.5} className="shrink-0 text-brand-blue" aria-hidden="true" />
+                        <span className="truncate">{vehicle.label}</span>
+                        <button
+                          type="button"
+                          onClick={clearVehicle}
+                          aria-label={`Rimuovi ${vehicle.label} dalla richiesta`}
+                          className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-brand-navy/70 transition-colors hover:bg-brand-ice hover:text-brand-navy ${FOCUS_RING}`}
+                        >
+                          <X size={16} strokeWidth={1.5} aria-hidden="true" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   <Field id="f-name" label="Nome e cognome" error={errors.name}>
                     <input type="text" autoComplete="name" value={values.name} onChange={set('name')} className={inputCls('name')} {...aria('name')} />
                   </Field>
@@ -1837,10 +2482,11 @@ export default function RubecaHomepage() {
   const [prefill, setPrefill] = useState(null);
 
   /* Dalla card flotte al form: preseleziona l'interesse e porta il visitatore al modulo */
-  const requestProposal = useCallback((interest) => {
-    setPrefill({ interest, at: Date.now() });
+  /* Anche dalle card veicolo: l'eventuale veicolo viaggia con il prefill.
+     Il focus sul primo campo vuoto lo gestisce ContactSection. */
+  const requestProposal = useCallback((interest, vehicle = null) => {
+    setPrefill({ interest, vehicle, at: Date.now() });
     scrollToId('contatti');
-    setTimeout(() => document.getElementById('f-name')?.focus({ preventScroll: true }), 600);
   }, []);
 
   return (
@@ -1855,6 +2501,7 @@ export default function RubecaHomepage() {
       <main id="main" tabIndex={-1} className="focus:outline-none">
         <Hero />
         <ServicesSection onRequest={requestProposal} />
+        <VehiclesSection onRequest={requestProposal} />
         <TrustSection />
         <ContactSection prefill={prefill} />
       </main>
